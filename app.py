@@ -39,6 +39,7 @@ class WebhookProcessor:
         self.test_mode = test_mode
         self.conversations_collection = db['test_conversations' if test_mode else 'conversations']
         self.messages_collection = db['test_messages' if test_mode else 'messages']
+        self.contacts_collection = db['test_contacts' if test_mode else 'contacts']
 
     def extract_media_type(self, message_data):
         """Extract media type from message"""
@@ -323,6 +324,104 @@ class WebhookProcessor:
         except Exception as e:
             logger.error(f"Error updating conversation: {str(e)}", exc_info=True)
 
+    def process_lifecycle_update(self, webhook_data):
+        """Process contact lifecycle update webhook"""
+        try:
+            if self.test_mode:
+                logger.info("=" * 80)
+                logger.info("TEST MODE - LIFECYCLE UPDATE WEBHOOK RECEIVED")
+                logger.info("=" * 80)
+                logger.info(json.dumps(webhook_data, indent=2))
+                logger.info("=" * 80)
+
+            contact = webhook_data.get('contact', {})
+            contact_id = contact.get('id')
+            phone = contact.get('phone', '')
+            lifecycle = webhook_data.get('lifecycle')
+            old_lifecycle = webhook_data.get('oldLifecycle')
+            event_type = webhook_data.get('event_type')
+            event_id = webhook_data.get('event_id')
+
+            if not contact_id and not phone:
+                logger.error("No contact_id or phone found in lifecycle webhook")
+                return False
+
+            # Use phone as primary identifier, fallback to contact_id
+            chat_id = phone if phone else str(contact_id)
+
+            # Update contact record
+            contact_doc = {
+                '_id': str(contact_id),
+                'phone': phone,
+                'firstName': contact.get('firstName'),
+                'lastName': contact.get('lastName'),
+                'email': contact.get('email'),
+                'language': contact.get('language'),
+                'profilePic': contact.get('profilePic'),
+                'countryCode': contact.get('countryCode'),
+                'status': contact.get('status'),
+                'lifecycle': lifecycle,
+                'tags': contact.get('tags', []),
+                'updated_at': datetime.now()
+            }
+
+            # Add assignee if present
+            if 'assignee' in contact:
+                contact_doc['assignee'] = contact['assignee']
+
+            # Add lifecycle history
+            lifecycle_change = {
+                'from': old_lifecycle,
+                'to': lifecycle,
+                'timestamp': datetime.now(),
+                'event_id': event_id
+            }
+
+            # Upsert contact with lifecycle history
+            self.contacts_collection.update_one(
+                {'_id': contact_doc['_id']},
+                {
+                    '$set': contact_doc,
+                    '$push': {'lifecycle_history': lifecycle_change}
+                },
+                upsert=True
+            )
+
+            logger.info(f"Contact lifecycle updated: {contact_id} - {old_lifecycle} → {lifecycle}")
+
+            # Also update the conversation record if it exists
+            conversation_update = {
+                'contact.lifecycle': lifecycle,
+                'updated_at': datetime.now()
+            }
+
+            result = self.conversations_collection.update_one(
+                {'_id': chat_id},
+                {'$set': conversation_update}
+            )
+
+            if result.matched_count > 0:
+                logger.info(f"Conversation lifecycle updated: {chat_id}")
+                logger.info(f"MongoDB update result - matched: {result.matched_count}, modified: {result.modified_count}")
+                if self.test_mode:
+                    # Verify the update
+                    updated_doc = self.conversations_collection.find_one({'_id': chat_id})
+                    logger.info(f"Verified contact.lifecycle in DB: {updated_doc.get('contact', {}).get('lifecycle', 'NOT FOUND')}")
+            else:
+                logger.info(f"No conversation found for contact: {chat_id}")
+
+            if self.test_mode:
+                logger.info(f"Saved to collection: {self.contacts_collection.name}")
+                logger.info(f"Database: {self.db.name}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing lifecycle update: {str(e)}", exc_info=True)
+            if self.test_mode:
+                logger.error(f"Failed webhook data: {json.dumps(webhook_data, indent=2)}")
+            return False
+
 
 # Initialize processors
 faster_processor = WebhookProcessor(FASTER_DB, test_mode=TEST_MODE)
@@ -410,6 +509,56 @@ def vip_outgoing():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
+@app.route('/webhook/faster/lifecycle', methods=['POST'])
+def faster_lifecycle():
+    """Handle contact lifecycle updates for Faster AI"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        # Check if it's a lifecycle update event
+        event_type = data.get('event_type')
+        if event_type != 'contact.lifecycle.updated':
+            return jsonify({'error': 'Invalid event type', 'expected': 'contact.lifecycle.updated'}), 400
+
+        success = faster_processor.process_lifecycle_update(data)
+
+        if success:
+            return jsonify({'status': 'success', 'message': 'Lifecycle update processed'}), 200
+        else:
+            return jsonify({'status': 'error', 'message': 'Processing failed'}), 500
+
+    except Exception as e:
+        logger.error(f"Error in faster_lifecycle endpoint: {str(e)}", exc_info=True)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/webhook/vip/lifecycle', methods=['POST'])
+def vip_lifecycle():
+    """Handle contact lifecycle updates for VIP"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        # Check if it's a lifecycle update event
+        event_type = data.get('event_type')
+        if event_type != 'contact.lifecycle.updated':
+            return jsonify({'error': 'Invalid event type', 'expected': 'contact.lifecycle.updated'}), 400
+
+        success = vip_processor.process_lifecycle_update(data)
+
+        if success:
+            return jsonify({'status': 'success', 'message': 'Lifecycle update processed'}), 200
+        else:
+            return jsonify({'status': 'error', 'message': 'Processing failed'}), 500
+
+    except Exception as e:
+        logger.error(f"Error in vip_lifecycle endpoint: {str(e)}", exc_info=True)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
@@ -419,8 +568,10 @@ def health():
         'endpoints': {
             'faster_incoming': '/webhook/faster/incoming',
             'faster_outgoing': '/webhook/faster/outgoing',
+            'faster_lifecycle': '/webhook/faster/lifecycle',
             'vip_incoming': '/webhook/vip/incoming',
-            'vip_outgoing': '/webhook/vip/outgoing'
+            'vip_outgoing': '/webhook/vip/outgoing',
+            'vip_lifecycle': '/webhook/vip/lifecycle'
         }
     }), 200
 
@@ -435,8 +586,10 @@ def index():
         'documentation': {
             'faster_incoming': 'POST /webhook/faster/incoming',
             'faster_outgoing': 'POST /webhook/faster/outgoing',
+            'faster_lifecycle': 'POST /webhook/faster/lifecycle',
             'vip_incoming': 'POST /webhook/vip/incoming',
             'vip_outgoing': 'POST /webhook/vip/outgoing',
+            'vip_lifecycle': 'POST /webhook/vip/lifecycle',
             'health': 'GET /health'
         }
     }), 200
@@ -448,8 +601,10 @@ if __name__ == '__main__':
     logger.info(f"Endpoints available:")
     logger.info(f"  - POST /webhook/faster/incoming")
     logger.info(f"  - POST /webhook/faster/outgoing")
+    logger.info(f"  - POST /webhook/faster/lifecycle")
     logger.info(f"  - POST /webhook/vip/incoming")
     logger.info(f"  - POST /webhook/vip/outgoing")
+    logger.info(f"  - POST /webhook/vip/lifecycle")
     logger.info(f"  - GET /health")
 
     app.run(host='0.0.0.0', port=PORT, debug=(os.getenv('FLASK_ENV') == 'development'))

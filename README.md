@@ -4,7 +4,8 @@ Flask application that receives webhooks from respond.io platform and stores con
 
 ## Features
 
-- **4 Webhook Endpoints**: Separate endpoints for Faster AI and VIP databases (incoming/outgoing)
+- **6 Webhook Endpoints**: Separate endpoints for Faster AI and VIP databases (incoming/outgoing/lifecycle)
+- **Contact Lifecycle Tracking**: Tracks contact lifecycle changes with full history
 - **Test Mode**: Feature flag to log webhooks to test collections for debugging
 - **Rich Data Mapping**: Comprehensive mapping from respond.io webhooks to MongoDB schema
 - **Multiple Message Types**: Supports text, image, video, document, audio, location, and more
@@ -38,10 +39,15 @@ The server will start on port 8000 by default.
 
 ### Webhook Endpoints
 
+#### Message Webhooks
 - `POST /webhook/faster/incoming` - Faster AI incoming messages
 - `POST /webhook/faster/outgoing` - Faster AI outgoing messages
 - `POST /webhook/vip/incoming` - VIP incoming messages
 - `POST /webhook/vip/outgoing` - VIP outgoing messages
+
+#### Lifecycle Webhooks
+- `POST /webhook/faster/lifecycle` - Faster AI contact lifecycle updates
+- `POST /webhook/vip/lifecycle` - VIP contact lifecycle updates
 
 ### Utility Endpoints
 
@@ -94,9 +100,45 @@ Stores conversation metadata:
     "firstName": "John",
     "lastName": "Doe",
     "phone": "+971585521050",
-    "email": "john@example.com"
+    "email": "john@example.com",
+    "lifecycle": "New Lead"
   },
   "updated_at": "2024-12-30T08:07:02.000Z"
+}
+```
+
+### Contacts Collection
+
+Stores contact information and lifecycle history:
+
+```json
+{
+  "_id": "1",
+  "phone": "+60123456789",
+  "firstName": "John",
+  "lastName": "Doe",
+  "email": "johndoe@sample.com",
+  "language": "en",
+  "profilePic": "https://cdn.chatapi.net/johndoe.png",
+  "countryCode": "MY",
+  "status": "open",
+  "lifecycle": "New Lead",
+  "tags": ["sampleTag1", "sampleTag2"],
+  "assignee": {
+    "id": 2,
+    "firstName": "Jane",
+    "lastName": "Smith",
+    "email": "jane@example.com"
+  },
+  "lifecycle_history": [
+    {
+      "from": "Hot Lead",
+      "to": "New Lead",
+      "timestamp": "2024-12-30T08:15:00.000Z",
+      "event_id": "ace5b7dc-cbcd-49a3-8940-9806e3847cbf"
+    }
+  ],
+  "updated_at": "2024-12-30T08:15:00.000Z"
 }
 ```
 
@@ -138,6 +180,8 @@ Stores individual messages:
 
 Use curl or Postman to test webhooks:
 
+### Test Message Webhook
+
 ```bash
 curl -X POST http://localhost:8000/webhook/faster/incoming \
   -H "Content-Type: application/json" \
@@ -162,6 +206,38 @@ curl -X POST http://localhost:8000/webhook/faster/incoming \
       "source": "whatsapp"
     },
     "event_type": "message.received"
+  }'
+```
+
+### Test Lifecycle Webhook
+
+```bash
+curl -X POST http://localhost:8000/webhook/faster/lifecycle \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contact": {
+      "id": 1,
+      "firstName": "John",
+      "lastName": "Doe",
+      "phone": "+60123456789",
+      "email": "johndoe@sample.com",
+      "language": "en",
+      "profilePic": "https://cdn.chatapi.net/johndoe.png",
+      "countryCode": "MY",
+      "status": "open",
+      "tags": ["sampleTag1", "sampleTag2"],
+      "assignee": {
+        "id": 2,
+        "firstName": "John",
+        "lastName": "Doe",
+        "email": "johndoe@sample.com"
+      }
+    },
+    "action": "updated",
+    "lifecycle": "New Lead",
+    "oldLifecycle": "Hot Lead",
+    "event_type": "contact.lifecycle.updated",
+    "event_id": "ace5b7dc-cbcd-49a3-8940-9806e3847cbf"
   }'
 ```
 
