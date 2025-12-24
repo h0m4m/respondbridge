@@ -249,7 +249,8 @@ class WebhookProcessor:
                         channels.append(channel_name)
                     update_doc['channel'] = channels
 
-                # Update contact information
+                # Update contact information (preserve lifecycle if it exists)
+                existing_contact = existing.get('contact', {})
                 update_doc['contact'] = {
                     'id': contact.get('id'),
                     'firstName': contact.get('firstName'),
@@ -261,6 +262,10 @@ class WebhookProcessor:
                     'countryCode': contact.get('countryCode'),
                     'status': contact.get('status')
                 }
+
+                # Preserve lifecycle if it exists in the existing contact
+                if 'lifecycle' in existing_contact:
+                    update_doc['contact']['lifecycle'] = existing_contact['lifecycle']
 
                 # Update assignee if present
                 if 'assignee' in contact:
