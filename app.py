@@ -5,6 +5,9 @@ from flask import Flask, request, jsonify
 from pymongo import MongoClient
 from dotenv import load_dotenv
 import logging
+from queue import Queue
+from threading import Thread, Lock
+import time
 
 # Load environment variables
 load_dotenv()
@@ -23,12 +26,34 @@ app = Flask(__name__)
 PORT = int(os.getenv('PORT', 8000))
 TEST_MODE = os.getenv('TEST_MODE', 'false').lower() == 'true'
 
-# MongoDB connections
-FASTER_CLIENT = MongoClient(os.getenv('MONGO_URI'))
+# MongoDB connections with pooling and timeouts
+FASTER_CLIENT = MongoClient(
+    os.getenv('MONGO_URI'),
+    maxPoolSize=50,
+    minPoolSize=10,
+    serverSelectionTimeoutMS=5000,
+    socketTimeoutMS=5000,
+    connectTimeoutMS=5000
+)
 FASTER_DB = FASTER_CLIENT[os.getenv('DB_NAME')]
 
-VIP_CLIENT = MongoClient(os.getenv('VIP_MONGO_URI'))
+VIP_CLIENT = MongoClient(
+    os.getenv('VIP_MONGO_URI'),
+    maxPoolSize=50,
+    minPoolSize=10,
+    serverSelectionTimeoutMS=5000,
+    socketTimeoutMS=5000,
+    connectTimeoutMS=5000
+)
 VIP_DB = VIP_CLIENT[os.getenv('VIP_DB_NAME')]
+
+# Background task queue
+webhook_queue = Queue(maxsize=10000)
+circuit_breaker_lock = Lock()
+circuit_breaker_failures = 0
+circuit_breaker_last_failure = 0
+CIRCUIT_BREAKER_THRESHOLD = 10
+CIRCUIT_BREAKER_TIMEOUT = 60
 
 
 class WebhookProcessor:
@@ -176,9 +201,11 @@ class WebhookProcessor:
                     'address': message_content.get('address')
                 }
 
-            # Insert or update message
+            # Insert or update message with timeout
             if message_doc['_id']:
-                result = self.messages_collection.update_one(
+                result = self.messages_collection.with_options(
+                    write_concern={"w": 1, "wtimeout": 5000}
+                ).update_one(
                     {'_id': message_doc['_id']},
                     {'$set': message_doc},
                     upsert=True
@@ -186,7 +213,9 @@ class WebhookProcessor:
                 logger.info(f"Message upserted: {message_id} (matched: {result.matched_count}, modified: {result.modified_count}, upserted_id: {result.upserted_id})")
             else:
                 message_doc.pop('_id')
-                result = self.messages_collection.insert_one(message_doc)
+                result = self.messages_collection.with_options(
+                    write_concern={"w": 1, "wtimeout": 5000}
+                ).insert_one(message_doc)
                 logger.info(f"Message inserted with _id: {result.inserted_id}")
 
             logger.info(f"Message saved: {message_id} for chat {chat_id}")
@@ -271,7 +300,9 @@ class WebhookProcessor:
                 if 'assignee' in contact:
                     update_doc['assignee'] = contact['assignee']
 
-                result = self.conversations_collection.update_one(
+                result = self.conversations_collection.with_options(
+                    write_concern={"w": 1, "wtimeout": 5000}
+                ).update_one(
                     {'_id': chat_id},
                     {'$set': update_doc}
                 )
@@ -316,7 +347,9 @@ class WebhookProcessor:
                 if media_type:
                     conversation_doc['media_counts'][media_type] = 1
 
-                result = self.conversations_collection.insert_one(conversation_doc)
+                result = self.conversations_collection.with_options(
+                    write_concern={"w": 1, "wtimeout": 5000}
+                ).insert_one(conversation_doc)
                 if self.test_mode:
                     logger.info(f"New conversation created with _id: {result.inserted_id}")
 
@@ -383,7 +416,9 @@ class WebhookProcessor:
             }
 
             # Upsert contact with lifecycle history
-            self.contacts_collection.update_one(
+            self.contacts_collection.with_options(
+                write_concern={"w": 1, "wtimeout": 5000}
+            ).update_one(
                 {'_id': contact_doc['_id']},
                 {
                     '$set': contact_doc,
@@ -400,7 +435,9 @@ class WebhookProcessor:
                 'updated_at': datetime.now()
             }
 
-            result = self.conversations_collection.update_one(
+            result = self.conversations_collection.with_options(
+                write_concern={"w": 1, "wtimeout": 5000}
+            ).update_one(
                 {'_id': chat_id},
                 {'$set': conversation_update}
             )
@@ -433,6 +470,99 @@ faster_processor = WebhookProcessor(FASTER_DB, test_mode=TEST_MODE)
 vip_processor = WebhookProcessor(VIP_DB, test_mode=TEST_MODE)
 
 
+def check_circuit_breaker():
+    """Check if circuit breaker is open"""
+    global circuit_breaker_failures, circuit_breaker_last_failure
+
+    with circuit_breaker_lock:
+        # Reset if timeout has passed
+        if time.time() - circuit_breaker_last_failure > CIRCUIT_BREAKER_TIMEOUT:
+            circuit_breaker_failures = 0
+            return False
+
+        # Check if circuit is open
+        return circuit_breaker_failures >= CIRCUIT_BREAKER_THRESHOLD
+
+
+def record_failure():
+    """Record a failure for circuit breaker"""
+    global circuit_breaker_failures, circuit_breaker_last_failure
+
+    with circuit_breaker_lock:
+        circuit_breaker_failures += 1
+        circuit_breaker_last_failure = time.time()
+
+        if circuit_breaker_failures >= CIRCUIT_BREAKER_THRESHOLD:
+            logger.error(f"Circuit breaker OPEN - {circuit_breaker_failures} failures")
+
+
+def record_success():
+    """Record a success for circuit breaker"""
+    global circuit_breaker_failures
+
+    with circuit_breaker_lock:
+        # Gradually decrease failure count on success
+        if circuit_breaker_failures > 0:
+            circuit_breaker_failures -= 1
+
+
+def webhook_worker():
+    """Background worker to process webhook queue"""
+    logger.info("Webhook worker thread started")
+
+    while True:
+        try:
+            # Get task from queue (blocking)
+            task = webhook_queue.get()
+
+            if task is None:
+                # Shutdown signal
+                break
+
+            processor, data, traffic_type, webhook_type = task
+
+            # Check circuit breaker
+            if check_circuit_breaker():
+                logger.warning("Circuit breaker OPEN - skipping webhook processing")
+                webhook_queue.task_done()
+                continue
+
+            # Process webhook
+            try:
+                if webhook_type == 'message':
+                    success = processor.process_webhook(data, traffic_type)
+                elif webhook_type == 'lifecycle':
+                    success = processor.process_lifecycle_update(data)
+                else:
+                    success = False
+
+                if success:
+                    record_success()
+                else:
+                    record_failure()
+
+            except Exception as e:
+                logger.error(f"Worker error processing webhook: {str(e)}", exc_info=True)
+                record_failure()
+
+            # Mark task as done
+            webhook_queue.task_done()
+
+        except Exception as e:
+            logger.error(f"Worker thread error: {str(e)}", exc_info=True)
+            time.sleep(1)  # Prevent tight loop on errors
+
+
+# Start worker threads
+NUM_WORKERS = int(os.getenv('WEBHOOK_WORKERS', '4'))
+worker_threads = []
+for i in range(NUM_WORKERS):
+    t = Thread(target=webhook_worker, daemon=True, name=f"WebhookWorker-{i}")
+    t.start()
+    worker_threads.append(t)
+    logger.info(f"Started worker thread {i+1}/{NUM_WORKERS}")
+
+
 # Webhook endpoints
 @app.route('/webhook/faster/incoming', methods=['POST'])
 def faster_incoming():
@@ -442,16 +572,22 @@ def faster_incoming():
         if not data:
             return jsonify({'error': 'No data provided'}), 400
 
-        success = faster_processor.process_webhook(data, 'incoming')
+        # Queue for async processing
+        try:
+            webhook_queue.put_nowait((faster_processor, data, 'incoming', 'message'))
+            logger.info("Webhook queued for processing: faster/incoming")
+        except:
+            logger.warning("Webhook queue full - processing synchronously")
+            # Fallback to sync if queue is full (prevents data loss)
+            faster_processor.process_webhook(data, 'incoming')
 
-        if success:
-            return jsonify({'status': 'success', 'message': 'Webhook processed'}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Processing failed'}), 500
+        # ALWAYS return 200 immediately
+        return jsonify({'status': 'received'}), 200
 
     except Exception as e:
         logger.error(f"Error in faster_incoming endpoint: {str(e)}", exc_info=True)
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        # Still return 200 to prevent webhook disabling
+        return jsonify({'status': 'received'}), 200
 
 
 @app.route('/webhook/faster/outgoing', methods=['POST'])
@@ -462,16 +598,21 @@ def faster_outgoing():
         if not data:
             return jsonify({'error': 'No data provided'}), 400
 
-        success = faster_processor.process_webhook(data, 'outgoing')
+        # Queue for async processing
+        try:
+            webhook_queue.put_nowait((faster_processor, data, 'outgoing', 'message'))
+            logger.info("Webhook queued for processing: faster/outgoing")
+        except:
+            logger.warning("Webhook queue full - processing synchronously")
+            faster_processor.process_webhook(data, 'outgoing')
 
-        if success:
-            return jsonify({'status': 'success', 'message': 'Webhook processed'}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Processing failed'}), 500
+        # ALWAYS return 200 immediately
+        return jsonify({'status': 'received'}), 200
 
     except Exception as e:
         logger.error(f"Error in faster_outgoing endpoint: {str(e)}", exc_info=True)
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        # Still return 200 to prevent webhook disabling
+        return jsonify({'status': 'received'}), 200
 
 
 @app.route('/webhook/vip/incoming', methods=['POST'])
@@ -482,16 +623,21 @@ def vip_incoming():
         if not data:
             return jsonify({'error': 'No data provided'}), 400
 
-        success = vip_processor.process_webhook(data, 'incoming')
+        # Queue for async processing
+        try:
+            webhook_queue.put_nowait((vip_processor, data, 'incoming', 'message'))
+            logger.info("Webhook queued for processing: vip/incoming")
+        except:
+            logger.warning("Webhook queue full - processing synchronously")
+            vip_processor.process_webhook(data, 'incoming')
 
-        if success:
-            return jsonify({'status': 'success', 'message': 'Webhook processed'}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Processing failed'}), 500
+        # ALWAYS return 200 immediately
+        return jsonify({'status': 'received'}), 200
 
     except Exception as e:
         logger.error(f"Error in vip_incoming endpoint: {str(e)}", exc_info=True)
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        # Still return 200 to prevent webhook disabling
+        return jsonify({'status': 'received'}), 200
 
 
 @app.route('/webhook/vip/outgoing', methods=['POST'])
@@ -502,16 +648,21 @@ def vip_outgoing():
         if not data:
             return jsonify({'error': 'No data provided'}), 400
 
-        success = vip_processor.process_webhook(data, 'outgoing')
+        # Queue for async processing
+        try:
+            webhook_queue.put_nowait((vip_processor, data, 'outgoing', 'message'))
+            logger.info("Webhook queued for processing: vip/outgoing")
+        except:
+            logger.warning("Webhook queue full - processing synchronously")
+            vip_processor.process_webhook(data, 'outgoing')
 
-        if success:
-            return jsonify({'status': 'success', 'message': 'Webhook processed'}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Processing failed'}), 500
+        # ALWAYS return 200 immediately
+        return jsonify({'status': 'received'}), 200
 
     except Exception as e:
         logger.error(f"Error in vip_outgoing endpoint: {str(e)}", exc_info=True)
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        # Still return 200 to prevent webhook disabling
+        return jsonify({'status': 'received'}), 200
 
 
 @app.route('/webhook/faster/lifecycle', methods=['POST'])
@@ -527,16 +678,21 @@ def faster_lifecycle():
         if event_type != 'contact.lifecycle.updated':
             return jsonify({'error': 'Invalid event type', 'expected': 'contact.lifecycle.updated'}), 400
 
-        success = faster_processor.process_lifecycle_update(data)
+        # Queue for async processing
+        try:
+            webhook_queue.put_nowait((faster_processor, data, None, 'lifecycle'))
+            logger.info("Webhook queued for processing: faster/lifecycle")
+        except:
+            logger.warning("Webhook queue full - processing synchronously")
+            faster_processor.process_lifecycle_update(data)
 
-        if success:
-            return jsonify({'status': 'success', 'message': 'Lifecycle update processed'}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Processing failed'}), 500
+        # ALWAYS return 200 immediately
+        return jsonify({'status': 'received'}), 200
 
     except Exception as e:
         logger.error(f"Error in faster_lifecycle endpoint: {str(e)}", exc_info=True)
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        # Still return 200 to prevent webhook disabling
+        return jsonify({'status': 'received'}), 200
 
 
 @app.route('/webhook/vip/lifecycle', methods=['POST'])
@@ -552,24 +708,42 @@ def vip_lifecycle():
         if event_type != 'contact.lifecycle.updated':
             return jsonify({'error': 'Invalid event type', 'expected': 'contact.lifecycle.updated'}), 400
 
-        success = vip_processor.process_lifecycle_update(data)
+        # Queue for async processing
+        try:
+            webhook_queue.put_nowait((vip_processor, data, None, 'lifecycle'))
+            logger.info("Webhook queued for processing: vip/lifecycle")
+        except:
+            logger.warning("Webhook queue full - processing synchronously")
+            vip_processor.process_lifecycle_update(data)
 
-        if success:
-            return jsonify({'status': 'success', 'message': 'Lifecycle update processed'}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Processing failed'}), 500
+        # ALWAYS return 200 immediately
+        return jsonify({'status': 'received'}), 200
 
     except Exception as e:
         logger.error(f"Error in vip_lifecycle endpoint: {str(e)}", exc_info=True)
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        # Still return 200 to prevent webhook disabling
+        return jsonify({'status': 'received'}), 200
 
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
+    queue_size = webhook_queue.qsize()
+    circuit_status = 'OPEN' if check_circuit_breaker() else 'CLOSED'
+
     return jsonify({
         'status': 'healthy',
         'test_mode': TEST_MODE,
+        'queue': {
+            'size': queue_size,
+            'max_size': webhook_queue.maxsize,
+            'workers': NUM_WORKERS
+        },
+        'circuit_breaker': {
+            'status': circuit_status,
+            'failures': circuit_breaker_failures,
+            'threshold': CIRCUIT_BREAKER_THRESHOLD
+        },
         'endpoints': {
             'faster_incoming': '/webhook/faster/incoming',
             'faster_outgoing': '/webhook/faster/outgoing',
