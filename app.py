@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
+from pymongo.write_concern import WriteConcern
 from dotenv import load_dotenv
 import logging
 from queue import Queue
@@ -204,7 +205,7 @@ class WebhookProcessor:
             # Insert or update message with timeout
             if message_doc['_id']:
                 result = self.messages_collection.with_options(
-                    write_concern={"w": 1, "wtimeout": 5000}
+                    write_concern=WriteConcern(w=1, wtimeout=5000)
                 ).update_one(
                     {'_id': message_doc['_id']},
                     {'$set': message_doc},
@@ -214,7 +215,7 @@ class WebhookProcessor:
             else:
                 message_doc.pop('_id')
                 result = self.messages_collection.with_options(
-                    write_concern={"w": 1, "wtimeout": 5000}
+                    write_concern=WriteConcern(w=1, wtimeout=5000)
                 ).insert_one(message_doc)
                 logger.info(f"Message inserted with _id: {result.inserted_id}")
 
@@ -301,7 +302,7 @@ class WebhookProcessor:
                     update_doc['assignee'] = contact['assignee']
 
                 result = self.conversations_collection.with_options(
-                    write_concern={"w": 1, "wtimeout": 5000}
+                    write_concern=WriteConcern(w=1, wtimeout=5000)
                 ).update_one(
                     {'_id': chat_id},
                     {'$set': update_doc}
@@ -348,7 +349,7 @@ class WebhookProcessor:
                     conversation_doc['media_counts'][media_type] = 1
 
                 result = self.conversations_collection.with_options(
-                    write_concern={"w": 1, "wtimeout": 5000}
+                    write_concern=WriteConcern(w=1, wtimeout=5000)
                 ).insert_one(conversation_doc)
                 if self.test_mode:
                     logger.info(f"New conversation created with _id: {result.inserted_id}")
@@ -417,7 +418,7 @@ class WebhookProcessor:
 
             # Upsert contact with lifecycle history
             self.contacts_collection.with_options(
-                write_concern={"w": 1, "wtimeout": 5000}
+                write_concern=WriteConcern(w=1, wtimeout=5000)
             ).update_one(
                 {'_id': contact_doc['_id']},
                 {
@@ -436,7 +437,7 @@ class WebhookProcessor:
             }
 
             result = self.conversations_collection.with_options(
-                write_concern={"w": 1, "wtimeout": 5000}
+                write_concern=WriteConcern(w=1, wtimeout=5000)
             ).update_one(
                 {'_id': chat_id},
                 {'$set': conversation_update}
