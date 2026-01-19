@@ -66,6 +66,7 @@ class WebhookProcessor:
         self.conversations_collection = db['test_conversations' if test_mode else 'conversations']
         self.messages_collection = db['test_messages' if test_mode else 'messages']
         self.contacts_collection = db['test_contacts' if test_mode else 'contacts']
+        self.internal_notes_collection = db['test_internal_notes' if test_mode else 'internal_notes']
 
     def extract_media_type(self, message_data):
         """Extract media type from message"""
@@ -465,6 +466,108 @@ class WebhookProcessor:
                 logger.error(f"Failed webhook data: {json.dumps(webhook_data, indent=2)}")
             return False
 
+    def process_internal_note(self, webhook_data):
+        """Process internal note (comment) webhook"""
+        try:
+            if self.test_mode:
+                logger.info("=" * 80)
+                logger.info("TEST MODE - INTERNAL NOTE WEBHOOK RECEIVED")
+                logger.info("=" * 80)
+                logger.info(json.dumps(webhook_data, indent=2))
+                logger.info("=" * 80)
+
+            contact = webhook_data.get('contact', {})
+            contact_id = contact.get('id')
+            phone = contact.get('phone', '')
+            text = webhook_data.get('text', '')
+            mentioned_user_ids = webhook_data.get('mentionedUserIds', [])
+            mentioned_user_emails = webhook_data.get('mentionedUserEmails', [])
+            event_type = webhook_data.get('event_type')
+            event_id = webhook_data.get('event_id')
+            created_at = webhook_data.get('contact', {}).get('created_at')
+
+            if not contact_id and not phone:
+                logger.error("No contact_id or phone found in internal note webhook")
+                return False
+
+            # Use phone as primary identifier, fallback to contact_id
+            chat_id = phone if phone else str(contact_id)
+
+            # Create internal note document
+            note_doc = {
+                '_id': event_id,
+                'chat_id': chat_id,
+                'contact_id': str(contact_id),
+                'contact': {
+                    'id': contact_id,
+                    'firstName': contact.get('firstName'),
+                    'lastName': contact.get('lastName'),
+                    'phone': phone,
+                    'email': contact.get('email'),
+                    'language': contact.get('language'),
+                    'profilePic': contact.get('profilePic'),
+                    'countryCode': contact.get('countryCode'),
+                    'status': contact.get('status')
+                },
+                'text': text,
+                'mentioned_user_ids': mentioned_user_ids,
+                'mentioned_user_emails': mentioned_user_emails,
+                'event_type': event_type,
+                'created_at': datetime.fromtimestamp(created_at) if created_at else datetime.now(),
+                'updated_at': datetime.now()
+            }
+
+            # Add assignee if present
+            if 'assignee' in contact:
+                note_doc['contact']['assignee'] = contact['assignee']
+
+            # Insert internal note
+            result = self.internal_notes_collection.with_options(
+                write_concern=WriteConcern(w=1, wtimeout=5000)
+            ).update_one(
+                {'_id': note_doc['_id']},
+                {'$set': note_doc},
+                upsert=True
+            )
+
+            logger.info(f"Internal note saved: {event_id} for contact {contact_id}")
+            if self.test_mode:
+                logger.info(f"MongoDB update result - matched: {result.matched_count}, modified: {result.modified_count}, upserted_id: {result.upserted_id}")
+                logger.info(f"Saved to collection: {self.internal_notes_collection.name}")
+                logger.info(f"Database: {self.db.name}")
+
+            # Update conversation to track internal notes
+            conversation_update = {
+                'last_internal_note_at': datetime.now(),
+                'updated_at': datetime.now()
+            }
+
+            # Increment internal note count
+            conversation_result = self.conversations_collection.with_options(
+                write_concern=WriteConcern(w=1, wtimeout=5000)
+            ).update_one(
+                {'_id': chat_id},
+                {
+                    '$set': conversation_update,
+                    '$inc': {'internal_note_count': 1}
+                }
+            )
+
+            if conversation_result.matched_count > 0:
+                logger.info(f"Conversation updated with internal note: {chat_id}")
+                if self.test_mode:
+                    logger.info(f"Conversation update result - matched: {conversation_result.matched_count}, modified: {conversation_result.modified_count}")
+            else:
+                logger.warning(f"No conversation found for contact: {chat_id}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing internal note: {str(e)}", exc_info=True)
+            if self.test_mode:
+                logger.error(f"Failed webhook data: {json.dumps(webhook_data, indent=2)}")
+            return False
+
 
 # Initialize processors
 faster_processor = WebhookProcessor(FASTER_DB, test_mode=TEST_MODE)
@@ -534,6 +637,8 @@ def webhook_worker():
                     success = processor.process_webhook(data, traffic_type)
                 elif webhook_type == 'lifecycle':
                     success = processor.process_lifecycle_update(data)
+                elif webhook_type == 'internal_note':
+                    success = processor.process_internal_note(data)
                 else:
                     success = False
 
@@ -726,6 +831,66 @@ def vip_lifecycle():
         return jsonify({'status': 'received'}), 200
 
 
+@app.route('/webhook/faster/internal-note', methods=['POST'])
+def faster_internal_note():
+    """Handle internal notes (comments) for Faster AI"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        # Check if it's a comment created event
+        event_type = data.get('event_type')
+        if event_type != 'comment.created':
+            return jsonify({'error': 'Invalid event type', 'expected': 'comment.created'}), 400
+
+        # Queue for async processing
+        try:
+            webhook_queue.put_nowait((faster_processor, data, None, 'internal_note'))
+            logger.info("Webhook queued for processing: faster/internal-note")
+        except:
+            logger.warning("Webhook queue full - processing synchronously")
+            faster_processor.process_internal_note(data)
+
+        # ALWAYS return 200 immediately
+        return jsonify({'status': 'received'}), 200
+
+    except Exception as e:
+        logger.error(f"Error in faster_internal_note endpoint: {str(e)}", exc_info=True)
+        # Still return 200 to prevent webhook disabling
+        return jsonify({'status': 'received'}), 200
+
+
+@app.route('/webhook/vip/internal-note', methods=['POST'])
+def vip_internal_note():
+    """Handle internal notes (comments) for VIP"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        # Check if it's a comment created event
+        event_type = data.get('event_type')
+        if event_type != 'comment.created':
+            return jsonify({'error': 'Invalid event type', 'expected': 'comment.created'}), 400
+
+        # Queue for async processing
+        try:
+            webhook_queue.put_nowait((vip_processor, data, None, 'internal_note'))
+            logger.info("Webhook queued for processing: vip/internal-note")
+        except:
+            logger.warning("Webhook queue full - processing synchronously")
+            vip_processor.process_internal_note(data)
+
+        # ALWAYS return 200 immediately
+        return jsonify({'status': 'received'}), 200
+
+    except Exception as e:
+        logger.error(f"Error in vip_internal_note endpoint: {str(e)}", exc_info=True)
+        # Still return 200 to prevent webhook disabling
+        return jsonify({'status': 'received'}), 200
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
@@ -749,9 +914,11 @@ def health():
             'faster_incoming': '/webhook/faster/incoming',
             'faster_outgoing': '/webhook/faster/outgoing',
             'faster_lifecycle': '/webhook/faster/lifecycle',
+            'faster_internal_note': '/webhook/faster/internal-note',
             'vip_incoming': '/webhook/vip/incoming',
             'vip_outgoing': '/webhook/vip/outgoing',
-            'vip_lifecycle': '/webhook/vip/lifecycle'
+            'vip_lifecycle': '/webhook/vip/lifecycle',
+            'vip_internal_note': '/webhook/vip/internal-note'
         }
     }), 200
 
@@ -767,9 +934,11 @@ def index():
             'faster_incoming': 'POST /webhook/faster/incoming',
             'faster_outgoing': 'POST /webhook/faster/outgoing',
             'faster_lifecycle': 'POST /webhook/faster/lifecycle',
+            'faster_internal_note': 'POST /webhook/faster/internal-note',
             'vip_incoming': 'POST /webhook/vip/incoming',
             'vip_outgoing': 'POST /webhook/vip/outgoing',
             'vip_lifecycle': 'POST /webhook/vip/lifecycle',
+            'vip_internal_note': 'POST /webhook/vip/internal-note',
             'health': 'GET /health'
         }
     }), 200
@@ -782,9 +951,11 @@ if __name__ == '__main__':
     logger.info(f"  - POST /webhook/faster/incoming")
     logger.info(f"  - POST /webhook/faster/outgoing")
     logger.info(f"  - POST /webhook/faster/lifecycle")
+    logger.info(f"  - POST /webhook/faster/internal-note")
     logger.info(f"  - POST /webhook/vip/incoming")
     logger.info(f"  - POST /webhook/vip/outgoing")
     logger.info(f"  - POST /webhook/vip/lifecycle")
+    logger.info(f"  - POST /webhook/vip/internal-note")
     logger.info(f"  - GET /health")
 
     app.run(host='0.0.0.0', port=PORT, debug=(os.getenv('FLASK_ENV') == 'development'))
