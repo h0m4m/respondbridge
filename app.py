@@ -484,7 +484,6 @@ class WebhookProcessor:
             mentioned_user_emails = webhook_data.get('mentionedUserEmails', [])
             event_type = webhook_data.get('event_type')
             event_id = webhook_data.get('event_id')
-            created_at = webhook_data.get('contact', {}).get('created_at')
 
             if not contact_id and not phone:
                 logger.error("No contact_id or phone found in internal note webhook")
@@ -513,8 +512,7 @@ class WebhookProcessor:
                 'mentioned_user_ids': mentioned_user_ids,
                 'mentioned_user_emails': mentioned_user_emails,
                 'event_type': event_type,
-                'created_at': datetime.fromtimestamp(created_at) if created_at else datetime.now(),
-                'updated_at': datetime.now()
+                'created_at': datetime.now()
             }
 
             # Add assignee if present
