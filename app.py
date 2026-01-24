@@ -4,6 +4,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
 from pymongo.write_concern import WriteConcern
+from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect
 from dotenv import load_dotenv
 import logging
 from queue import Queue
@@ -27,14 +28,17 @@ app = Flask(__name__)
 PORT = int(os.getenv('PORT', 8000))
 TEST_MODE = os.getenv('TEST_MODE', 'false').lower() == 'true'
 
-# MongoDB connections with pooling and timeouts
+# MongoDB connections with pooling and extended timeouts
+# Increased timeouts to handle MongoDB Atlas network latency and replica set elections
 FASTER_CLIENT = MongoClient(
     os.getenv('MONGO_URI'),
     maxPoolSize=50,
     minPoolSize=10,
-    serverSelectionTimeoutMS=5000,
-    socketTimeoutMS=5000,
-    connectTimeoutMS=5000
+    serverSelectionTimeoutMS=30000,  # 30s - allow time for replica set primary election
+    socketTimeoutMS=20000,            # 20s - allow time for slow queries
+    connectTimeoutMS=20000,           # 20s - allow time for initial connection
+    retryWrites=True,                 # Enable automatic retry for write operations
+    retryReads=True                   # Enable automatic retry for read operations
 )
 FASTER_DB = FASTER_CLIENT[os.getenv('DB_NAME')]
 
@@ -42,19 +46,58 @@ VIP_CLIENT = MongoClient(
     os.getenv('VIP_MONGO_URI'),
     maxPoolSize=50,
     minPoolSize=10,
-    serverSelectionTimeoutMS=5000,
-    socketTimeoutMS=5000,
-    connectTimeoutMS=5000
+    serverSelectionTimeoutMS=30000,  # 30s - allow time for replica set primary election
+    socketTimeoutMS=20000,            # 20s - allow time for slow queries
+    connectTimeoutMS=20000,           # 20s - allow time for initial connection
+    retryWrites=True,                 # Enable automatic retry for write operations
+    retryReads=True                   # Enable automatic retry for read operations
 )
 VIP_DB = VIP_CLIENT[os.getenv('VIP_DB_NAME')]
+
+# Connection health monitoring
+connection_health_lock = Lock()
+last_health_check = 0
+health_check_interval = 30  # Check every 30 seconds
+
+
+def check_mongodb_health():
+    """Check MongoDB connection health and log status"""
+    global last_health_check
+
+    current_time = time.time()
+
+    # Rate limit health checks
+    with connection_health_lock:
+        if current_time - last_health_check < health_check_interval:
+            return
+        last_health_check = current_time
+
+    # Check FASTER_CLIENT health
+    try:
+        FASTER_CLIENT.admin.command('ping')
+        server_info = FASTER_CLIENT.server_info()
+        logger.info(f"MongoDB FASTER health OK - version {server_info.get('version', 'unknown')}")
+    except Exception as e:
+        logger.error(f"MongoDB FASTER health check failed: {str(e)}")
+
+    # Check VIP_CLIENT health
+    try:
+        VIP_CLIENT.admin.command('ping')
+        server_info = VIP_CLIENT.server_info()
+        logger.info(f"MongoDB VIP health OK - version {server_info.get('version', 'unknown')}")
+    except Exception as e:
+        logger.error(f"MongoDB VIP health check failed: {str(e)}")
+
 
 # Background task queue
 webhook_queue = Queue(maxsize=10000)
 circuit_breaker_lock = Lock()
 circuit_breaker_failures = 0
 circuit_breaker_last_failure = 0
+circuit_breaker_half_open_successes = 0
 CIRCUIT_BREAKER_THRESHOLD = 10
 CIRCUIT_BREAKER_TIMEOUT = 60
+CIRCUIT_BREAKER_HALF_OPEN_THRESHOLD = 3  # Successes needed to close circuit
 
 
 class WebhookProcessor:
@@ -572,40 +615,79 @@ faster_processor = WebhookProcessor(FASTER_DB, test_mode=TEST_MODE)
 vip_processor = WebhookProcessor(VIP_DB, test_mode=TEST_MODE)
 
 
+def retry_operation(func, *args, max_retries=3, **kwargs):
+    """Retry operation with exponential backoff for MongoDB errors"""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except (ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect) as e:
+            if attempt == max_retries - 1:
+                logger.error(f"MongoDB operation failed after {max_retries} attempts: {str(e)}")
+                raise
+
+            # Exponential backoff: 1s, 2s, 4s
+            wait_time = 2 ** attempt
+            logger.warning(f"MongoDB error on attempt {attempt + 1}/{max_retries}, retrying in {wait_time}s: {str(e)}")
+            time.sleep(wait_time)
+
+    return None
+
+
 def check_circuit_breaker():
-    """Check if circuit breaker is open"""
-    global circuit_breaker_failures, circuit_breaker_last_failure
+    """Check circuit breaker state and allow half-open state for recovery"""
+    global circuit_breaker_failures, circuit_breaker_last_failure, circuit_breaker_half_open_successes
 
     with circuit_breaker_lock:
-        # Reset if timeout has passed
-        if time.time() - circuit_breaker_last_failure > CIRCUIT_BREAKER_TIMEOUT:
-            circuit_breaker_failures = 0
+        # If circuit is closed, return False
+        if circuit_breaker_failures < CIRCUIT_BREAKER_THRESHOLD:
             return False
 
-        # Check if circuit is open
-        return circuit_breaker_failures >= CIRCUIT_BREAKER_THRESHOLD
+        # Circuit is open - check if timeout has passed for half-open state
+        time_since_failure = time.time() - circuit_breaker_last_failure
+
+        if time_since_failure > CIRCUIT_BREAKER_TIMEOUT:
+            # Enter half-open state - allow limited requests through
+            logger.info(f"Circuit breaker entering HALF-OPEN state after {CIRCUIT_BREAKER_TIMEOUT}s timeout")
+            return False  # Allow request through to test recovery
+
+        # Circuit is fully open
+        return True
 
 
 def record_failure():
     """Record a failure for circuit breaker"""
-    global circuit_breaker_failures, circuit_breaker_last_failure
+    global circuit_breaker_failures, circuit_breaker_last_failure, circuit_breaker_half_open_successes
 
     with circuit_breaker_lock:
         circuit_breaker_failures += 1
         circuit_breaker_last_failure = time.time()
+        circuit_breaker_half_open_successes = 0  # Reset success counter
 
         if circuit_breaker_failures >= CIRCUIT_BREAKER_THRESHOLD:
             logger.error(f"Circuit breaker OPEN - {circuit_breaker_failures} failures")
+        elif circuit_breaker_failures >= CIRCUIT_BREAKER_THRESHOLD - 3:
+            logger.warning(f"Circuit breaker warning - {circuit_breaker_failures}/{CIRCUIT_BREAKER_THRESHOLD} failures")
 
 
 def record_success():
-    """Record a success for circuit breaker"""
-    global circuit_breaker_failures
+    """Record a success for circuit breaker with gradual recovery"""
+    global circuit_breaker_failures, circuit_breaker_half_open_successes
 
     with circuit_breaker_lock:
-        # Gradually decrease failure count on success
-        if circuit_breaker_failures > 0:
-            circuit_breaker_failures -= 1
+        # If circuit was open/half-open, increment success counter
+        if circuit_breaker_failures >= CIRCUIT_BREAKER_THRESHOLD:
+            circuit_breaker_half_open_successes += 1
+            logger.info(f"Circuit breaker HALF-OPEN - success {circuit_breaker_half_open_successes}/{CIRCUIT_BREAKER_HALF_OPEN_THRESHOLD}")
+
+            # Close circuit if enough successes
+            if circuit_breaker_half_open_successes >= CIRCUIT_BREAKER_HALF_OPEN_THRESHOLD:
+                circuit_breaker_failures = 0
+                circuit_breaker_half_open_successes = 0
+                logger.info("Circuit breaker CLOSED - recovery successful")
+        else:
+            # Gradually decrease failure count on success
+            if circuit_breaker_failures > 0:
+                circuit_breaker_failures -= 1
 
 
 def webhook_worker():
@@ -629,14 +711,18 @@ def webhook_worker():
                 webhook_queue.task_done()
                 continue
 
-            # Process webhook
+            # Process webhook with retry logic
             try:
+                # Periodic health check
+                check_mongodb_health()
+
+                # Wrap processing in retry logic
                 if webhook_type == 'message':
-                    success = processor.process_webhook(data, traffic_type)
+                    success = retry_operation(processor.process_webhook, data, traffic_type)
                 elif webhook_type == 'lifecycle':
-                    success = processor.process_lifecycle_update(data)
+                    success = retry_operation(processor.process_lifecycle_update, data)
                 elif webhook_type == 'internal_note':
-                    success = processor.process_internal_note(data)
+                    success = retry_operation(processor.process_internal_note, data)
                 else:
                     success = False
 
@@ -645,6 +731,9 @@ def webhook_worker():
                 else:
                     record_failure()
 
+            except (ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect) as e:
+                logger.error(f"MongoDB connection error after retries: {str(e)}", exc_info=True)
+                record_failure()
             except Exception as e:
                 logger.error(f"Worker error processing webhook: {str(e)}", exc_info=True)
                 record_failure()
@@ -891,12 +980,37 @@ def vip_internal_note():
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
+    """Health check endpoint with MongoDB connection status"""
     queue_size = webhook_queue.qsize()
-    circuit_status = 'OPEN' if check_circuit_breaker() else 'CLOSED'
+    is_circuit_open = check_circuit_breaker()
+
+    # Determine circuit breaker state
+    if is_circuit_open:
+        circuit_status = 'OPEN'
+    elif circuit_breaker_failures >= CIRCUIT_BREAKER_THRESHOLD:
+        circuit_status = 'HALF_OPEN'
+    else:
+        circuit_status = 'CLOSED'
+
+    # Check MongoDB connection health
+    mongodb_status = {}
+    try:
+        FASTER_CLIENT.admin.command('ping')
+        mongodb_status['faster'] = 'connected'
+    except Exception as e:
+        mongodb_status['faster'] = f'error: {str(e)[:100]}'
+
+    try:
+        VIP_CLIENT.admin.command('ping')
+        mongodb_status['vip'] = 'connected'
+    except Exception as e:
+        mongodb_status['vip'] = f'error: {str(e)[:100]}'
+
+    # Overall health status
+    overall_status = 'healthy' if mongodb_status.get('faster') == 'connected' and mongodb_status.get('vip') == 'connected' else 'degraded'
 
     return jsonify({
-        'status': 'healthy',
+        'status': overall_status,
         'test_mode': TEST_MODE,
         'queue': {
             'size': queue_size,
@@ -906,8 +1020,11 @@ def health():
         'circuit_breaker': {
             'status': circuit_status,
             'failures': circuit_breaker_failures,
-            'threshold': CIRCUIT_BREAKER_THRESHOLD
+            'threshold': CIRCUIT_BREAKER_THRESHOLD,
+            'half_open_successes': circuit_breaker_half_open_successes,
+            'time_since_last_failure': int(time.time() - circuit_breaker_last_failure) if circuit_breaker_last_failure > 0 else 0
         },
+        'mongodb': mongodb_status,
         'endpoints': {
             'faster_incoming': '/webhook/faster/incoming',
             'faster_outgoing': '/webhook/faster/outgoing',
