@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /Users/humammourad/Projects/respondbridge/*.md)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('app.py', doraise=True\\)\")"
+    ]
+  }
+}

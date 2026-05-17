@@ -343,14 +343,45 @@ class WebhookProcessor:
 
                 # Update assignee if present
                 if 'assignee' in contact:
-                    update_doc['assignee'] = contact['assignee']
+                    new_assignee = contact['assignee']
+                    new_assignee['assigned_at'] = datetime.now()
+                    update_doc['assignee'] = new_assignee
 
-                result = self.conversations_collection.with_options(
-                    write_concern=WriteConcern(w=1, wtimeout=5000)
-                ).update_one(
-                    {'_id': chat_id},
-                    {'$set': update_doc}
-                )
+                    # Build assignee history entry
+                    assignee_history_entry = {
+                        'id': new_assignee.get('id'),
+                        'firstName': new_assignee.get('firstName'),
+                        'lastName': new_assignee.get('lastName'),
+                        'email': new_assignee.get('email'),
+                        'assigned_at': new_assignee['assigned_at']
+                    }
+
+                    # Check if assignee actually changed
+                    old_assignee = existing.get('assignee', {})
+                    if old_assignee.get('id') != new_assignee.get('id'):
+                        result = self.conversations_collection.with_options(
+                            write_concern=WriteConcern(w=1, wtimeout=5000)
+                        ).update_one(
+                            {'_id': chat_id},
+                            {
+                                '$set': update_doc,
+                                '$push': {'assignee_history': assignee_history_entry}
+                            }
+                        )
+                    else:
+                        result = self.conversations_collection.with_options(
+                            write_concern=WriteConcern(w=1, wtimeout=5000)
+                        ).update_one(
+                            {'_id': chat_id},
+                            {'$set': update_doc}
+                        )
+                else:
+                    result = self.conversations_collection.with_options(
+                        write_concern=WriteConcern(w=1, wtimeout=5000)
+                    ).update_one(
+                        {'_id': chat_id},
+                        {'$set': update_doc}
+                    )
                 if self.test_mode:
                     logger.info(f"Conversation updated: matched={result.matched_count}, modified={result.modified_count}")
             else:
@@ -386,7 +417,16 @@ class WebhookProcessor:
 
                 # Add assignee if present
                 if 'assignee' in contact:
-                    conversation_doc['assignee'] = contact['assignee']
+                    new_assignee = contact['assignee']
+                    new_assignee['assigned_at'] = datetime.now()
+                    conversation_doc['assignee'] = new_assignee
+                    conversation_doc['assignee_history'] = [{
+                        'id': new_assignee.get('id'),
+                        'firstName': new_assignee.get('firstName'),
+                        'lastName': new_assignee.get('lastName'),
+                        'email': new_assignee.get('email'),
+                        'assigned_at': new_assignee['assigned_at']
+                    }]
 
                 # Initialize media count if applicable using media_type
                 if media_type:
@@ -449,8 +489,23 @@ class WebhookProcessor:
             }
 
             # Add assignee if present
+            assignee_history_entry = None
             if 'assignee' in contact:
-                contact_doc['assignee'] = contact['assignee']
+                new_assignee = contact['assignee']
+                new_assignee['assigned_at'] = datetime.now()
+                contact_doc['assignee'] = new_assignee
+
+                # Check if assignee changed compared to existing record
+                existing_contact = self.contacts_collection.find_one({'_id': str(contact_id)})
+                old_assignee = existing_contact.get('assignee', {}) if existing_contact else {}
+                if old_assignee.get('id') != new_assignee.get('id'):
+                    assignee_history_entry = {
+                        'id': new_assignee.get('id'),
+                        'firstName': new_assignee.get('firstName'),
+                        'lastName': new_assignee.get('lastName'),
+                        'email': new_assignee.get('email'),
+                        'assigned_at': new_assignee['assigned_at']
+                    }
 
             # Add lifecycle history
             lifecycle_change = {
@@ -460,6 +515,11 @@ class WebhookProcessor:
                 'event_id': event_id
             }
 
+            # Build push operations
+            push_ops = {'lifecycle_history': lifecycle_change}
+            if assignee_history_entry:
+                push_ops['assignee_history'] = assignee_history_entry
+
             # Upsert contact with lifecycle history
             self.contacts_collection.with_options(
                 write_concern=WriteConcern(w=1, wtimeout=5000)
@@ -467,7 +527,7 @@ class WebhookProcessor:
                 {'_id': contact_doc['_id']},
                 {
                     '$set': contact_doc,
-                    '$push': {'lifecycle_history': lifecycle_change}
+                    '$push': push_ops
                 },
                 upsert=True
             )
@@ -560,7 +620,9 @@ class WebhookProcessor:
 
             # Add assignee if present
             if 'assignee' in contact:
-                note_doc['contact']['assignee'] = contact['assignee']
+                new_assignee = contact['assignee']
+                new_assignee['assigned_at'] = datetime.now()
+                note_doc['contact']['assignee'] = new_assignee
 
             # Insert internal note
             result = self.internal_notes_collection.with_options(
