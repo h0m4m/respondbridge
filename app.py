@@ -818,14 +818,25 @@ for i in range(NUM_WORKERS):
     logger.info(f"Started worker thread {i+1}/{NUM_WORKERS}")
 
 
+# Global error handler: ensure webhook paths NEVER return non-200
+@app.errorhandler(Exception)
+def handle_exception(e):
+    if request.path.startswith('/webhook/'):
+        logger.error(f"Unhandled exception on {request.path}: {str(e)}", exc_info=True)
+        return jsonify({'status': 'received'}), 200
+    # Re-raise for non-webhook routes (health checks, etc.)
+    raise e
+
+
 # Webhook endpoints
 @app.route('/webhook/faster/incoming', methods=['POST'])
 def faster_incoming():
     """Handle incoming messages for Faster AI"""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            logger.warning("faster_incoming: empty or malformed JSON payload, ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Queue for async processing
         try:
@@ -849,9 +860,10 @@ def faster_incoming():
 def faster_outgoing():
     """Handle outgoing messages for Faster AI"""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            logger.warning("faster_outgoing: empty or malformed JSON payload, ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Queue for async processing
         try:
@@ -874,9 +886,10 @@ def faster_outgoing():
 def vip_incoming():
     """Handle incoming messages for VIP"""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            logger.warning("vip_incoming: empty or malformed JSON payload, ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Queue for async processing
         try:
@@ -899,9 +912,10 @@ def vip_incoming():
 def vip_outgoing():
     """Handle outgoing messages for VIP"""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            logger.warning("vip_outgoing: empty or malformed JSON payload, ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Queue for async processing
         try:
@@ -924,14 +938,16 @@ def vip_outgoing():
 def faster_lifecycle():
     """Handle contact lifecycle updates for Faster AI"""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            logger.warning("faster_lifecycle: empty or malformed JSON payload, ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Check if it's a lifecycle update event
         event_type = data.get('event_type')
         if event_type != 'contact.lifecycle.updated':
-            return jsonify({'error': 'Invalid event type', 'expected': 'contact.lifecycle.updated'}), 400
+            logger.warning(f"faster_lifecycle: unexpected event type '{event_type}', ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Queue for async processing
         try:
@@ -954,14 +970,16 @@ def faster_lifecycle():
 def vip_lifecycle():
     """Handle contact lifecycle updates for VIP"""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            logger.warning("vip_lifecycle: empty or malformed JSON payload, ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Check if it's a lifecycle update event
         event_type = data.get('event_type')
         if event_type != 'contact.lifecycle.updated':
-            return jsonify({'error': 'Invalid event type', 'expected': 'contact.lifecycle.updated'}), 400
+            logger.warning(f"vip_lifecycle: unexpected event type '{event_type}', ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Queue for async processing
         try:
@@ -984,14 +1002,16 @@ def vip_lifecycle():
 def faster_internal_note():
     """Handle internal notes (comments) for Faster AI"""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            logger.warning("faster_internal_note: empty or malformed JSON payload, ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Check if it's a comment created event
         event_type = data.get('event_type')
         if event_type != 'comment.created':
-            return jsonify({'error': 'Invalid event type', 'expected': 'comment.created'}), 400
+            logger.warning(f"faster_internal_note: unexpected event type '{event_type}', ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Queue for async processing
         try:
@@ -1014,14 +1034,16 @@ def faster_internal_note():
 def vip_internal_note():
     """Handle internal notes (comments) for VIP"""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
         if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            logger.warning("vip_internal_note: empty or malformed JSON payload, ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Check if it's a comment created event
         event_type = data.get('event_type')
         if event_type != 'comment.created':
-            return jsonify({'error': 'Invalid event type', 'expected': 'comment.created'}), 400
+            logger.warning(f"vip_internal_note: unexpected event type '{event_type}', ignoring")
+            return jsonify({'status': 'received'}), 200
 
         # Queue for async processing
         try:
