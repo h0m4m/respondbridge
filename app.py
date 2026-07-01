@@ -100,16 +100,81 @@ CIRCUIT_BREAKER_TIMEOUT = 60
 CIRCUIT_BREAKER_HALF_OPEN_THRESHOLD = 3  # Successes needed to close circuit
 
 
+import re
+from datetime import timezone, timedelta
+
+
+def norm_phone(raw):
+    """Normalize a UAE phone number (ported from the n8n Email Leads flow)."""
+    if not raw:
+        return ''
+    s = str(raw).strip()
+    had_plus = s.startswith('+')
+    d = re.sub(r'[^0-9]', '', s)
+    if not d:
+        return str(raw).strip()
+    if d.startswith('00'):
+        d = d[2:]
+    if d.startswith('9710'):
+        d = '971' + d[4:]
+    if d.startswith('971'):
+        return '+' + d
+    if had_plus:
+        return '+' + d
+    if d.startswith('0'):
+        return '+971' + d.lstrip('0')
+    return '+971' + d
+
+
+def dubai_minute(ts_ms):
+    """ms epoch -> 'YYYY-MM-DD HH:MM' in Asia/Dubai (UTC+4)."""
+    if not ts_ms:
+        return ''
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(timezone(timedelta(hours=4)))
+    return dt.strftime('%Y-%m-%d %H:%M')
+
+
+def parse_vip_inquiry(body):
+    """Parse a VIP website-inquiry email body into a field map, or None if it
+    isn't a genuine inquiry. 1:1 port of the n8n 'VIP — Email Leads' Extract."""
+    body = body or ''
+    labels = ['Full Name', 'Phone', 'Car Name', 'Car Link', 'Message']
+    b = body.replace(' :', ':')
+    for l in labels:
+        b = b.replace(l + ':', '\n' + l + ':')
+    parts = b.split('\n')
+    m = {}
+    for i, part in enumerate(parts):
+        ci = part.find(':')
+        if ci < 0:
+            continue
+        k = part[:ci].strip()
+        v = part[ci + 1:].strip()
+        if k == 'Message':
+            rest = '\n'.join(parts[i + 1:]).strip()
+            if rest:
+                v = (v + '\n' + rest).strip()
+            m[k] = v
+            break
+        if k in labels:
+            m[k] = v
+    if not (m.get('Full Name') or m.get('Car Name') or m.get('Car Link')):
+        return None
+    return m
+
+
 class WebhookProcessor:
     """Processes webhook data and saves to MongoDB"""
 
-    def __init__(self, db, test_mode=False):
+    def __init__(self, db, test_mode=False, tenant=None):
         self.db = db
         self.test_mode = test_mode
+        self.tenant = tenant
         self.conversations_collection = db['test_conversations' if test_mode else 'conversations']
         self.messages_collection = db['test_messages' if test_mode else 'messages']
         self.contacts_collection = db['test_contacts' if test_mode else 'contacts']
         self.internal_notes_collection = db['test_internal_notes' if test_mode else 'internal_notes']
+        self.email_leads_collection = db['test_email_leads' if test_mode else 'email_leads']
 
     def extract_media_type(self, message_data):
         """Extract media type from message"""
@@ -265,6 +330,14 @@ class WebhookProcessor:
 
             logger.info(f"Message saved: {message_id} for chat {chat_id}")
 
+            # VIP website-inquiry emails -> structured lead (matched to a phone
+            # if the customer already exists on WhatsApp). Never break ingestion.
+            if traffic_type == 'incoming' and message_type == 'email':
+                try:
+                    self.process_email_lead(message_content, message_id, chat_id, contact, channel, timestamp)
+                except Exception as e:
+                    logger.error(f"Email lead processing failed: {str(e)}", exc_info=True)
+
             if self.test_mode:
                 logger.info(f"Saved to collection: {self.messages_collection.name}")
                 logger.info(f"Database: {self.db.name}")
@@ -289,6 +362,59 @@ class WebhookProcessor:
             if self.test_mode:
                 logger.error(f"Failed webhook data: {json.dumps(webhook_data, indent=2)}")
             return False
+
+    def process_email_lead(self, message_content, message_id, chat_id, contact, channel, timestamp):
+        """VIP only: parse a website-inquiry email into `email_leads`, matched
+        to the customer's WhatsApp phone if one already exists. Replaces the
+        n8n 'VIP — Email Leads' flow (the raw email is already stored above)."""
+        if self.tenant != 'vip':
+            return
+        body = message_content.get('message', '') if isinstance(message_content, dict) else ''
+        parsed = parse_vip_inquiry(body)
+        if not parsed:
+            return  # spam / reply / not a genuine website inquiry
+
+        customer_phone = norm_phone(parsed.get('Phone'))
+        dt = dubai_minute(timestamp)
+        mid = (str(message_id).strip() if message_id else '') or (customer_phone + '|' + dt)
+
+        # Phone match: does this customer already have a WhatsApp conversation?
+        # Conversations are keyed by phone as _id. Always read the live
+        # collection (never the test_ one) so matching works in test mode too.
+        matched_chat_id = None
+        matched_name = None
+        if customer_phone:
+            try:
+                conv = self.db['conversations'].find_one({'_id': customer_phone}, {'contact': 1})
+                if conv:
+                    matched_chat_id = customer_phone
+                    matched_name = (conv.get('contact') or {}).get('firstName')
+            except Exception as e:
+                logger.error(f"Phone match lookup failed: {str(e)}")
+
+        doc = {
+            'message_id': mid,
+            'customer_phone': customer_phone,
+            'customer_name': parsed.get('Full Name', ''),
+            'car_name': parsed.get('Car Name', ''),
+            'car_link': parsed.get('Car Link', ''),
+            'message': parsed.get('Message', ''),
+            'subject': message_content.get('subject', '') if isinstance(message_content, dict) else '',
+            'channel': channel.get('name', '') if isinstance(channel, dict) else '',
+            'datetime': dt,
+            'ts_ms': timestamp,
+            'source': 'vip-email-leads',
+            'type': 'email_lead',
+            'matched': bool(matched_chat_id),
+            'matched_chat_id': matched_chat_id,
+            'matched_name': matched_name,
+            'email_contact_id': chat_id,
+            'updated_at': datetime.now(),
+        }
+        self.email_leads_collection.with_options(
+            write_concern=WriteConcern(w=1, wtimeout=5000)
+        ).update_one({'message_id': mid}, {'$set': doc}, upsert=True)
+        logger.info(f"Email lead upserted: {mid} phone={customer_phone} matched={bool(matched_chat_id)}")
 
     def update_conversation(self, chat_id, contact, channel, message, media_type, timestamp):
         """Update or create conversation record"""
@@ -673,8 +799,8 @@ class WebhookProcessor:
 
 
 # Initialize processors
-faster_processor = WebhookProcessor(FASTER_DB, test_mode=TEST_MODE)
-vip_processor = WebhookProcessor(VIP_DB, test_mode=TEST_MODE)
+faster_processor = WebhookProcessor(FASTER_DB, test_mode=TEST_MODE, tenant='faster')
+vip_processor = WebhookProcessor(VIP_DB, test_mode=TEST_MODE, tenant='vip')
 
 
 def retry_operation(func, *args, max_retries=3, **kwargs):
