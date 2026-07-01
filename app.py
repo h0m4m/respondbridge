@@ -163,6 +163,30 @@ def parse_vip_inquiry(body):
     return m
 
 
+def parse_faster_booking(body):
+    """Parse a Faster website-booking email body into a field map, or None if
+    it isn't a genuine booking. 1:1 port of the n8n 'Faster — Email Leads'
+    Extract. Labels use ' :' and the fields arrive concatenated without
+    newlines, so we split on each label to rebuild the structure."""
+    body = body or ''
+    labels = ['Rental Number', 'Car Name', 'Car Url', 'Customer Name',
+              'Customer Email', 'Customer Phone', 'Pickup Date', 'Dropoff Date']
+    b = body
+    for l in labels:
+        b = b.replace(l + ' :', '\n' + l + ' :')
+    m = {}
+    for line in b.split('\n'):
+        i = line.find(':')
+        if i > 0:
+            k = line[:i].strip()
+            v = line[i + 1:].strip()
+            if k in labels:
+                m[k] = v
+    if not (m.get('Customer Name') or m.get('Car Name') or m.get('Car Url') or m.get('Rental Number')):
+        return None
+    return m
+
+
 class WebhookProcessor:
     """Processes webhook data and saves to MongoDB"""
 
@@ -364,17 +388,42 @@ class WebhookProcessor:
             return False
 
     def process_email_lead(self, message_content, message_id, chat_id, contact, channel, timestamp):
-        """VIP only: parse a website-inquiry email into `email_leads`, matched
-        to the customer's WhatsApp phone if one already exists. Replaces the
-        n8n 'VIP — Email Leads' flow (the raw email is already stored above)."""
-        if self.tenant != 'vip':
+        """Parse a website inquiry/booking email into `email_leads`, matched to
+        the customer's existing WhatsApp conversation by phone when one exists.
+        Replaces the n8n Email Leads flows (the raw email is already stored
+        above). VIP = website-inquiry format; Faster = website-booking format."""
+        if self.tenant not in ('vip', 'faster'):
             return
         body = message_content.get('message', '') if isinstance(message_content, dict) else ''
-        parsed = parse_vip_inquiry(body)
-        if not parsed:
-            return  # spam / reply / not a genuine website inquiry
 
-        customer_phone = norm_phone(parsed.get('Phone'))
+        if self.tenant == 'vip':
+            parsed = parse_vip_inquiry(body)
+            if not parsed:
+                return  # spam / reply / not a genuine inquiry
+            customer_phone = norm_phone(parsed.get('Phone'))
+            lead_fields = {
+                'customer_name': parsed.get('Full Name', ''),
+                'car_name': parsed.get('Car Name', ''),
+                'car_link': parsed.get('Car Link', ''),
+                'message': parsed.get('Message', ''),
+            }
+            source = 'vip-email-leads'
+        else:  # faster
+            parsed = parse_faster_booking(body)
+            if not parsed:
+                return  # spam / reply / not a genuine booking
+            customer_phone = norm_phone(parsed.get('Customer Phone'))
+            lead_fields = {
+                'customer_name': parsed.get('Customer Name', ''),
+                'customer_email': parsed.get('Customer Email', ''),
+                'car_name': parsed.get('Car Name', ''),
+                'car_url': parsed.get('Car Url', ''),
+                'rental_number': parsed.get('Rental Number', ''),
+                'pickup_date': parsed.get('Pickup Date', ''),
+                'dropoff_date': parsed.get('Dropoff Date', ''),
+            }
+            source = 'faster-email-leads'
+
         dt = dubai_minute(timestamp)
         mid = (str(message_id).strip() if message_id else '') or (customer_phone + '|' + dt)
 
@@ -395,26 +444,23 @@ class WebhookProcessor:
         doc = {
             'message_id': mid,
             'customer_phone': customer_phone,
-            'customer_name': parsed.get('Full Name', ''),
-            'car_name': parsed.get('Car Name', ''),
-            'car_link': parsed.get('Car Link', ''),
-            'message': parsed.get('Message', ''),
             'subject': message_content.get('subject', '') if isinstance(message_content, dict) else '',
             'channel': channel.get('name', '') if isinstance(channel, dict) else '',
             'datetime': dt,
             'ts_ms': timestamp,
-            'source': 'vip-email-leads',
+            'source': source,
             'type': 'email_lead',
             'matched': bool(matched_chat_id),
             'matched_chat_id': matched_chat_id,
             'matched_name': matched_name,
             'email_contact_id': chat_id,
             'updated_at': datetime.now(),
+            **lead_fields,
         }
         self.email_leads_collection.with_options(
             write_concern=WriteConcern(w=1, wtimeout=5000)
         ).update_one({'message_id': mid}, {'$set': doc}, upsert=True)
-        logger.info(f"Email lead upserted: {mid} phone={customer_phone} matched={bool(matched_chat_id)}")
+        logger.info(f"Email lead ({source}) upserted: {mid} phone={customer_phone} matched={bool(matched_chat_id)}")
 
     def update_conversation(self, chat_id, contact, channel, message, media_type, timestamp):
         """Update or create conversation record"""
