@@ -10,6 +10,7 @@ import logging
 from queue import Queue
 from threading import Thread, Lock
 import time
+import supabase_mirror
 
 # Load environment variables
 load_dotenv()
@@ -353,6 +354,8 @@ class WebhookProcessor:
                 logger.info(f"Message inserted with _id: {result.inserted_id}")
 
             logger.info(f"Message saved: {message_id} for chat {chat_id}")
+            supabase_mirror.message(self.tenant, message_doc, contact, channel,
+                                    self.extract_media_type(message), timestamp)
 
             # VIP website-inquiry emails -> structured lead (matched to a phone
             # if the customer already exists on WhatsApp). Never break ingestion.
@@ -461,6 +464,7 @@ class WebhookProcessor:
             write_concern=WriteConcern(w=1, wtimeout=5000)
         ).update_one({'message_id': mid}, {'$set': doc}, upsert=True)
         logger.info(f"Email lead ({source}) upserted: {mid} phone={customer_phone} matched={bool(matched_chat_id)}")
+        supabase_mirror.email_lead(self.tenant, mid, doc)
 
     def update_conversation(self, chat_id, contact, channel, message, media_type, timestamp):
         """Update or create conversation record"""
@@ -705,6 +709,7 @@ class WebhookProcessor:
             )
 
             logger.info(f"Contact lifecycle updated: {contact_id} - {old_lifecycle} → {lifecycle}")
+            supabase_mirror.lifecycle(self.tenant, contact, lifecycle, old_lifecycle, event_id)
 
             # Also update the conversation record if it exists
             conversation_update = {
@@ -806,6 +811,7 @@ class WebhookProcessor:
             )
 
             logger.info(f"Internal note saved: {event_id} for contact {contact_id}")
+            supabase_mirror.internal_note(self.tenant, note_doc)
             if self.test_mode:
                 logger.info(f"MongoDB update result - matched: {result.matched_count}, modified: {result.modified_count}, upserted_id: {result.upserted_id}")
                 logger.info(f"Saved to collection: {self.internal_notes_collection.name}")
@@ -1281,6 +1287,7 @@ def health():
             'time_since_last_failure': int(time.time() - circuit_breaker_last_failure) if circuit_breaker_last_failure > 0 else 0
         },
         'mongodb': mongodb_status,
+        'supabase_mirror': {'enabled': supabase_mirror.ENABLED, **supabase_mirror.stats},
         'endpoints': {
             'faster_incoming': '/webhook/faster/incoming',
             'faster_outgoing': '/webhook/faster/outgoing',
