@@ -14,6 +14,7 @@ Rules:
 import json
 import logging
 import os
+import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -42,7 +43,7 @@ def _jsonable(v):
     return v
 
 
-def _rpc(fn, args, attempts=3):
+def _rpc(fn, args, attempts=6):
     body = json.dumps(_jsonable(args), default=str).encode()
     req = urllib.request.Request(
         f"{URL}/rest/v1/rpc/{fn}", data=body, method="POST",
@@ -51,7 +52,7 @@ def _rpc(fn, args, attempts=3):
     )
     for i in range(attempts):
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=20) as r:
                 r.read()
             with _lock:
                 stats["ok"] += 1
@@ -65,6 +66,9 @@ def _rpc(fn, args, attempts=3):
             if i == attempts - 1:
                 _fail(f"{fn}: {e}")
                 return
+        # 1, 2, 4, 8, 16 s — a busy database gets time to breathe (15 Oct 2026: three quick retries lost
+        # 15 messages at 14:29 UTC while the history copy was loading Supabase)
+        time.sleep(2 ** i)
 
 
 def _fail(msg):
