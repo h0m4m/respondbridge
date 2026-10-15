@@ -216,8 +216,8 @@ class WebhookProcessor:
             return 'media'
         return None
 
-    def process_webhook(self, webhook_data, traffic_type):
-        """Process incoming webhook data"""
+    def build_message(self, webhook_data, traffic_type):
+        """Turn a respond.io message webhook into what both stores write (no I/O). None = nothing to store."""
         try:
             if self.test_mode:
                 logger.info("=" * 80)
@@ -237,7 +237,7 @@ class WebhookProcessor:
 
             if not phone and not contact_id:
                 logger.error("No phone or contact_id found in webhook")
-                return False
+                return None
 
             # Use phone as primary identifier, fallback to contact_id
             chat_id = phone if phone else str(contact_id)
@@ -336,73 +336,98 @@ class WebhookProcessor:
                     'address': message_content.get('address')
                 }
 
-            # Insert or update message with timeout
-            if message_doc['_id']:
-                result = self.messages_collection.with_options(
-                    write_concern=WriteConcern(w=1, wtimeout=5000)
-                ).update_one(
-                    {'_id': message_doc['_id']},
-                    {'$set': message_doc},
-                    upsert=True
-                )
-                logger.info(f"Message upserted: {message_id} (matched: {result.matched_count}, modified: {result.modified_count}, upserted_id: {result.upserted_id})")
-            else:
-                message_doc.pop('_id')
-                result = self.messages_collection.with_options(
-                    write_concern=WriteConcern(w=1, wtimeout=5000)
-                ).insert_one(message_doc)
-                logger.info(f"Message inserted with _id: {result.inserted_id}")
-
-            logger.info(f"Message saved: {message_id} for chat {chat_id}")
-            supabase_mirror.message(self.tenant, message_doc, contact, channel,
-                                    self.extract_media_type(message), timestamp)
-
-            # VIP website-inquiry emails -> structured lead (matched to a phone
-            # if the customer already exists on WhatsApp). Never break ingestion.
-            if traffic_type == 'incoming' and message_type == 'email':
-                try:
-                    self.process_email_lead(message_content, message_id, chat_id, contact, channel, timestamp)
-                except Exception as e:
-                    logger.error(f"Email lead processing failed: {str(e)}", exc_info=True)
-
-            if self.test_mode:
-                logger.info(f"Saved to collection: {self.messages_collection.name}")
-                logger.info(f"Database: {self.db.name}")
-
-            # Extract actual media type for conversation tracking
-            media_type = self.extract_media_type(message)
-
-            # Update or create conversation
-            self.update_conversation(
-                chat_id=chat_id,
-                contact=contact,
-                channel=channel,
-                message=message,
-                media_type=media_type,
-                timestamp=timestamp
-            )
-
-            return True
+            return {
+                'message_doc': message_doc, 'contact': contact, 'channel': channel, 'message': message,
+                'message_content': message_content, 'message_type': message_type, 'message_id': message_id,
+                'chat_id': chat_id, 'timestamp': timestamp, 'traffic_type': traffic_type,
+                'media_type': self.extract_media_type(message),
+            }
 
         except Exception as e:
-            logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
+            logger.error(f"Error reading webhook: {str(e)}", exc_info=True)
             if self.test_mode:
                 logger.error(f"Failed webhook data: {json.dumps(webhook_data, indent=2)}")
-            return False
+            return None
 
-    def process_email_lead(self, message_content, message_id, chat_id, contact, channel, timestamp):
+    def is_email_lead(self, ctx):
+        return ctx['traffic_type'] == 'incoming' and ctx['message_type'] == 'email'
+
+    def sb_message(self, ctx):
+        """Supabase first: the message (and its conversation counters), then a website-email lead."""
+        supabase_mirror.message(self.tenant, ctx['message_doc'], ctx['contact'], ctx['channel'],
+                                ctx['media_type'], ctx['timestamp'])
+        if self.is_email_lead(ctx):
+            try:
+                lead = self.email_lead_doc(ctx)
+                if lead:
+                    supabase_mirror.email_lead(self.tenant, lead['message_id'], lead)
+            except Exception as e:
+                logger.error(f"Email lead (Supabase) failed: {str(e)}", exc_info=True)
+
+    def mongo_message(self, ctx):
+        """Mongo second (kept while the FasterAI platform reads it)."""
+        message_doc = dict(ctx['message_doc'])
+        message_id, chat_id = ctx['message_id'], ctx['chat_id']
+        if message_doc['_id']:
+            result = self.messages_collection.with_options(
+                write_concern=WriteConcern(w=1, wtimeout=5000)
+            ).update_one(
+                {'_id': message_doc['_id']},
+                {'$set': message_doc},
+                upsert=True
+            )
+            logger.info(f"Message upserted: {message_id} (matched: {result.matched_count}, modified: {result.modified_count}, upserted_id: {result.upserted_id})")
+        else:
+            message_doc.pop('_id')
+            result = self.messages_collection.with_options(
+                write_concern=WriteConcern(w=1, wtimeout=5000)
+            ).insert_one(message_doc)
+            logger.info(f"Message inserted with _id: {result.inserted_id}")
+        logger.info(f"Message saved: {message_id} for chat {chat_id}")
+
+        # VIP / Faster website emails -> structured lead. Never break ingestion.
+        if self.is_email_lead(ctx):
+            try:
+                lead = self.email_lead_doc(ctx)
+                if lead:
+                    self.email_leads_collection.with_options(
+                        write_concern=WriteConcern(w=1, wtimeout=5000)
+                    ).update_one({'message_id': lead['message_id']}, {'$set': lead}, upsert=True)
+                    logger.info(f"Email lead ({lead['source']}) upserted: {lead['message_id']} phone={lead['customer_phone']} matched={lead['matched']}")
+            except Exception as e:
+                logger.error(f"Email lead processing failed: {str(e)}", exc_info=True)
+
+        self.update_conversation(
+            chat_id=chat_id,
+            contact=ctx['contact'],
+            channel=ctx['channel'],
+            message=ctx['message'],
+            media_type=ctx['media_type'],
+            timestamp=ctx['timestamp']
+        )
+        return True
+
+    def email_lead_doc(self, ctx):
+        """The email_leads doc for a website email, built once per task (cached on ctx). None = not a lead."""
+        if '_lead' in ctx:
+            return ctx['_lead']
+        ctx['_lead'] = self._email_lead_doc(ctx['message_content'], ctx['message_id'], ctx['chat_id'],
+                                            ctx['contact'], ctx['channel'], ctx['timestamp'])
+        return ctx['_lead']
+
+    def _email_lead_doc(self, message_content, message_id, chat_id, contact, channel, timestamp):
         """Parse a website inquiry/booking email into `email_leads`, matched to
         the customer's existing WhatsApp conversation by phone when one exists.
         Replaces the n8n Email Leads flows (the raw email is already stored
         above). VIP = website-inquiry format; Faster = website-booking format."""
         if self.tenant not in ('vip', 'faster'):
-            return
+            return None
         body = message_content.get('message', '') if isinstance(message_content, dict) else ''
 
         if self.tenant == 'vip':
             parsed = parse_vip_inquiry(body)
             if not parsed:
-                return  # spam / reply / not a genuine inquiry
+                return None  # spam / reply / not a genuine inquiry
             customer_phone = norm_phone(parsed.get('Phone'))
             lead_fields = {
                 'customer_name': parsed.get('Full Name', ''),
@@ -414,7 +439,7 @@ class WebhookProcessor:
         else:  # faster
             parsed = parse_faster_booking(body)
             if not parsed:
-                return  # spam / reply / not a genuine booking
+                return None  # spam / reply / not a genuine booking
             customer_phone = norm_phone(parsed.get('Customer Phone'))
             lead_fields = {
                 'customer_name': parsed.get('Customer Name', ''),
@@ -437,10 +462,14 @@ class WebhookProcessor:
         matched_name = None
         if customer_phone:
             try:
-                conv = self.db['conversations'].find_one({'_id': customer_phone}, {'contact': 1})
-                if conv:
+                if supabase_mirror.ENABLED:
+                    found = supabase_mirror.conversation_contact(self.tenant, customer_phone)
+                else:
+                    conv = self.db['conversations'].find_one({'_id': customer_phone}, {'contact': 1})
+                    found = (conv.get('contact') or {}) if conv else None
+                if found is not None:
                     matched_chat_id = customer_phone
-                    matched_name = (conv.get('contact') or {}).get('firstName')
+                    matched_name = found.get('firstName')
             except Exception as e:
                 logger.error(f"Phone match lookup failed: {str(e)}")
 
@@ -460,11 +489,7 @@ class WebhookProcessor:
             'updated_at': datetime.now(),
             **lead_fields,
         }
-        self.email_leads_collection.with_options(
-            write_concern=WriteConcern(w=1, wtimeout=5000)
-        ).update_one({'message_id': mid}, {'$set': doc}, upsert=True)
-        logger.info(f"Email lead ({source}) upserted: {mid} phone={customer_phone} matched={bool(matched_chat_id)}")
-        supabase_mirror.email_lead(self.tenant, mid, doc)
+        return doc
 
     def update_conversation(self, chat_id, contact, channel, message, media_type, timestamp):
         """Update or create conversation record"""
@@ -623,8 +648,25 @@ class WebhookProcessor:
         except Exception as e:
             logger.error(f"Error updating conversation: {str(e)}", exc_info=True)
 
+    def build_lifecycle(self, webhook_data):
+        contact = webhook_data.get('contact', {})
+        if not contact.get('id') and not contact.get('phone'):
+            logger.error("No contact_id or phone found in lifecycle webhook")
+            return None
+        return {'webhook': webhook_data}
+
+    def sb_lifecycle(self, ctx):
+        w = ctx['webhook']
+        supabase_mirror.lifecycle(self.tenant, w.get('contact', {}), w.get('lifecycle'),
+                                  w.get('oldLifecycle'), w.get('event_id'))
+
+    def mongo_lifecycle(self, ctx):
+        if not self.process_lifecycle_update(ctx['webhook']):
+            raise RuntimeError('lifecycle not saved to Mongo')
+        return True
+
     def process_lifecycle_update(self, webhook_data):
-        """Process contact lifecycle update webhook"""
+        """Process contact lifecycle update webhook (the Mongo half)"""
         try:
             if self.test_mode:
                 logger.info("=" * 80)
@@ -709,7 +751,6 @@ class WebhookProcessor:
             )
 
             logger.info(f"Contact lifecycle updated: {contact_id} - {old_lifecycle} → {lifecycle}")
-            supabase_mirror.lifecycle(self.tenant, contact, lifecycle, old_lifecycle, event_id)
 
             # Also update the conversation record if it exists
             conversation_update = {
@@ -746,8 +787,52 @@ class WebhookProcessor:
                 logger.error(f"Failed webhook data: {json.dumps(webhook_data, indent=2)}")
             return False
 
+    def build_note(self, webhook_data):
+        contact = webhook_data.get('contact', {})
+        if not contact.get('id') and not contact.get('phone'):
+            logger.error("No contact_id or phone found in internal note webhook")
+            return None
+        return {'webhook': webhook_data}
+
+    def sb_note(self, ctx):
+        supabase_mirror.internal_note(self.tenant, self.note_doc(ctx['webhook']))
+
+    def mongo_note(self, ctx):
+        if not self.process_internal_note(ctx['webhook']):
+            raise RuntimeError('internal note not saved to Mongo')
+        return True
+
+    def note_doc(self, webhook_data):
+        contact = webhook_data.get('contact', {})
+        contact_id = contact.get('id')
+        phone = contact.get('phone', '')
+        doc = {
+            '_id': webhook_data.get('event_id'),
+            'chat_id': phone if phone else str(contact_id),
+            'contact_id': str(contact_id),
+            'contact': {
+                'id': contact_id,
+                'firstName': contact.get('firstName'),
+                'lastName': contact.get('lastName'),
+                'phone': phone,
+                'email': contact.get('email'),
+                'language': contact.get('language'),
+                'profilePic': contact.get('profilePic'),
+                'countryCode': contact.get('countryCode'),
+                'status': contact.get('status')
+            },
+            'text': webhook_data.get('text', ''),
+            'mentioned_user_ids': webhook_data.get('mentionedUserIds', []),
+            'mentioned_user_emails': webhook_data.get('mentionedUserEmails', []),
+            'event_type': webhook_data.get('event_type'),
+            'created_at': datetime.now()
+        }
+        if 'assignee' in contact:
+            doc['contact']['assignee'] = {**contact['assignee'], 'assigned_at': datetime.now()}
+        return doc
+
     def process_internal_note(self, webhook_data):
-        """Process internal note (comment) webhook"""
+        """Process internal note (comment) webhook (the Mongo half)"""
         try:
             if self.test_mode:
                 logger.info("=" * 80)
@@ -811,7 +896,6 @@ class WebhookProcessor:
             )
 
             logger.info(f"Internal note saved: {event_id} for contact {contact_id}")
-            supabase_mirror.internal_note(self.tenant, note_doc)
             if self.test_mode:
                 logger.info(f"MongoDB update result - matched: {result.matched_count}, modified: {result.modified_count}, upserted_id: {result.upserted_id}")
                 logger.info(f"Saved to collection: {self.internal_notes_collection.name}")
@@ -930,60 +1014,114 @@ def record_success():
                 circuit_breaker_failures -= 1
 
 
+# Mongo is the second store now, kept while the FasterAI platform still reads it.
+# MONGO_WRITE=false stops writing it (Supabase keeps everything).
+MONGO_WRITE = os.getenv('MONGO_WRITE', 'true').lower() == 'true'
+PROCESSORS = {'faster': None, 'vip': None}  # filled below, after the processors exist
+STEPS = {
+    'message': ('build_message', 'sb_message', 'mongo_message'),
+    'lifecycle': ('build_lifecycle', 'sb_lifecycle', 'mongo_lifecycle'),
+    'internal_note': ('build_note', 'sb_note', 'mongo_note'),
+}
+
+
+def run_task(processor, data, traffic_type, kind, inbox_id=None, need_sb=True, need_mongo=None):
+    """One webhook: Supabase first, then Mongo. Each half is marked on its inbox row; a half that fails
+    stays open there and the replayer runs it again (both halves are idempotent)."""
+    if need_mongo is None:
+        need_mongo = MONGO_WRITE
+    build, sb_step, mongo_step = STEPS[kind]
+    ctx = getattr(processor, build)(data, traffic_type) if kind == 'message' else getattr(processor, build)(data)
+    if ctx is None:  # nothing storable in it — close the row
+        supabase_mirror.inbox_mark(inbox_id, 'sb')
+        supabase_mirror.inbox_mark(inbox_id, 'mongo')
+        return
+
+    if need_sb and supabase_mirror.ENABLED:
+        try:
+            getattr(processor, sb_step)(ctx)
+            supabase_mirror.inbox_mark(inbox_id, 'sb')
+        except Exception as e:
+            logger.error(f"Supabase write failed ({processor.tenant}/{kind}) — left for replay: {e}")
+            supabase_mirror.inbox_mark(inbox_id, 'sb', e)
+    elif need_sb:
+        supabase_mirror.inbox_mark(inbox_id, 'sb')
+
+    if not MONGO_WRITE:
+        supabase_mirror.inbox_mark(inbox_id, 'mongo')
+        return
+    if not need_mongo:
+        return
+    if check_circuit_breaker():
+        logger.warning("Circuit breaker OPEN - Mongo half left for replay")
+        supabase_mirror.inbox_mark(inbox_id, 'mongo', 'circuit breaker open')
+        return
+    try:
+        check_mongodb_health()
+        retry_operation(getattr(processor, mongo_step), ctx)
+        record_success()
+        supabase_mirror.inbox_mark(inbox_id, 'mongo')
+    except Exception as e:
+        logger.error(f"Mongo write failed ({processor.tenant}/{kind}): {e}", exc_info=True)
+        record_failure()
+        supabase_mirror.inbox_mark(inbox_id, 'mongo', e)
+
+
+def enqueue(processor, data, traffic_type, kind):
+    """Inbox first (durable), then the in-memory queue. A full queue runs the task right here."""
+    inbox_id = supabase_mirror.inbox_put(processor.tenant, kind, traffic_type, data)
+    try:
+        webhook_queue.put_nowait((processor, data, traffic_type, kind, inbox_id, True, None))
+        logger.info(f"Webhook queued for processing: {processor.tenant}/{traffic_type or kind}")
+    except Exception:
+        logger.warning("Webhook queue full - processing synchronously")
+        run_task(processor, data, traffic_type, kind, inbox_id)
+
+
 def webhook_worker():
     """Background worker to process webhook queue"""
     logger.info("Webhook worker thread started")
 
     while True:
         try:
-            # Get task from queue (blocking)
             task = webhook_queue.get()
-
             if task is None:
-                # Shutdown signal
                 break
-
-            processor, data, traffic_type, webhook_type = task
-
-            # Check circuit breaker
-            if check_circuit_breaker():
-                logger.warning("Circuit breaker OPEN - skipping webhook processing")
-                webhook_queue.task_done()
-                continue
-
-            # Process webhook with retry logic
             try:
-                # Periodic health check
-                check_mongodb_health()
-
-                # Wrap processing in retry logic
-                if webhook_type == 'message':
-                    success = retry_operation(processor.process_webhook, data, traffic_type)
-                elif webhook_type == 'lifecycle':
-                    success = retry_operation(processor.process_lifecycle_update, data)
-                elif webhook_type == 'internal_note':
-                    success = retry_operation(processor.process_internal_note, data)
-                else:
-                    success = False
-
-                if success:
-                    record_success()
-                else:
-                    record_failure()
-
-            except (ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect) as e:
-                logger.error(f"MongoDB connection error after retries: {str(e)}", exc_info=True)
-                record_failure()
+                run_task(*task)
             except Exception as e:
                 logger.error(f"Worker error processing webhook: {str(e)}", exc_info=True)
-                record_failure()
-
-            # Mark task as done
             webhook_queue.task_done()
-
         except Exception as e:
             logger.error(f"Worker thread error: {str(e)}", exc_info=True)
             time.sleep(1)  # Prevent tight loop on errors
+
+
+REPLAY_EVERY_SEC = int(os.getenv('INBOX_REPLAY_EVERY_SEC', '60'))
+REPLAY_AFTER_SEC = int(os.getenv('INBOX_REPLAY_AFTER_SEC', '90'))
+
+
+def inbox_replayer():
+    """Every minute: webhooks whose Supabase or Mongo half is still open after 90 s (a restart, a full
+    queue, an outage) are claimed — one worker process gets each — and run again."""
+    logger.info("Inbox replayer started")
+    while True:
+        time.sleep(REPLAY_EVERY_SEC)
+        try:
+            rows = supabase_mirror.inbox_claim(REPLAY_AFTER_SEC, MONGO_WRITE, 200)
+            for r in rows:
+                processor = PROCESSORS.get('vip' if r.get('company') == 'VIP' else 'faster')
+                task = (processor, r.get('payload') or {}, r.get('traffic'), r.get('kind'), r.get('id'),
+                        not r.get('sb_done'), MONGO_WRITE and not r.get('mongo_done'))
+                try:
+                    webhook_queue.put_nowait(task)
+                except Exception:
+                    run_task(*task)
+            if rows:
+                supabase_mirror._bump('replayed', len(rows))
+                logger.warning(f"Inbox replay: {len(rows)} webhook(s) re-run")
+        except Exception as e:
+            logger.error(f"Inbox replayer error: {e}", exc_info=True)
 
 
 # Start worker threads
@@ -994,6 +1132,11 @@ for i in range(NUM_WORKERS):
     t.start()
     worker_threads.append(t)
     logger.info(f"Started worker thread {i+1}/{NUM_WORKERS}")
+
+PROCESSORS['faster'] = faster_processor
+PROCESSORS['vip'] = vip_processor
+if supabase_mirror.INBOX:
+    Thread(target=inbox_replayer, daemon=True, name="InboxReplayer").start()
 
 
 # Global error handler: ensure webhook paths NEVER return non-200
@@ -1016,14 +1159,8 @@ def faster_incoming():
             logger.warning("faster_incoming: empty or malformed JSON payload, ignoring")
             return jsonify({'status': 'received'}), 200
 
-        # Queue for async processing
-        try:
-            webhook_queue.put_nowait((faster_processor, data, 'incoming', 'message'))
-            logger.info("Webhook queued for processing: faster/incoming")
-        except:
-            logger.warning("Webhook queue full - processing synchronously")
-            # Fallback to sync if queue is full (prevents data loss)
-            faster_processor.process_webhook(data, 'incoming')
+        # Inbox first (durable), then the queue
+        enqueue(faster_processor, data, 'incoming', 'message')
 
         # ALWAYS return 200 immediately
         return jsonify({'status': 'received'}), 200
@@ -1043,13 +1180,8 @@ def faster_outgoing():
             logger.warning("faster_outgoing: empty or malformed JSON payload, ignoring")
             return jsonify({'status': 'received'}), 200
 
-        # Queue for async processing
-        try:
-            webhook_queue.put_nowait((faster_processor, data, 'outgoing', 'message'))
-            logger.info("Webhook queued for processing: faster/outgoing")
-        except:
-            logger.warning("Webhook queue full - processing synchronously")
-            faster_processor.process_webhook(data, 'outgoing')
+        # Inbox first (durable), then the queue
+        enqueue(faster_processor, data, 'outgoing', 'message')
 
         # ALWAYS return 200 immediately
         return jsonify({'status': 'received'}), 200
@@ -1069,13 +1201,8 @@ def vip_incoming():
             logger.warning("vip_incoming: empty or malformed JSON payload, ignoring")
             return jsonify({'status': 'received'}), 200
 
-        # Queue for async processing
-        try:
-            webhook_queue.put_nowait((vip_processor, data, 'incoming', 'message'))
-            logger.info("Webhook queued for processing: vip/incoming")
-        except:
-            logger.warning("Webhook queue full - processing synchronously")
-            vip_processor.process_webhook(data, 'incoming')
+        # Inbox first (durable), then the queue
+        enqueue(vip_processor, data, 'incoming', 'message')
 
         # ALWAYS return 200 immediately
         return jsonify({'status': 'received'}), 200
@@ -1095,13 +1222,8 @@ def vip_outgoing():
             logger.warning("vip_outgoing: empty or malformed JSON payload, ignoring")
             return jsonify({'status': 'received'}), 200
 
-        # Queue for async processing
-        try:
-            webhook_queue.put_nowait((vip_processor, data, 'outgoing', 'message'))
-            logger.info("Webhook queued for processing: vip/outgoing")
-        except:
-            logger.warning("Webhook queue full - processing synchronously")
-            vip_processor.process_webhook(data, 'outgoing')
+        # Inbox first (durable), then the queue
+        enqueue(vip_processor, data, 'outgoing', 'message')
 
         # ALWAYS return 200 immediately
         return jsonify({'status': 'received'}), 200
@@ -1127,13 +1249,8 @@ def faster_lifecycle():
             logger.warning(f"faster_lifecycle: unexpected event type '{event_type}', ignoring")
             return jsonify({'status': 'received'}), 200
 
-        # Queue for async processing
-        try:
-            webhook_queue.put_nowait((faster_processor, data, None, 'lifecycle'))
-            logger.info("Webhook queued for processing: faster/lifecycle")
-        except:
-            logger.warning("Webhook queue full - processing synchronously")
-            faster_processor.process_lifecycle_update(data)
+        # Inbox first (durable), then the queue
+        enqueue(faster_processor, data, None, 'lifecycle')
 
         # ALWAYS return 200 immediately
         return jsonify({'status': 'received'}), 200
@@ -1159,13 +1276,8 @@ def vip_lifecycle():
             logger.warning(f"vip_lifecycle: unexpected event type '{event_type}', ignoring")
             return jsonify({'status': 'received'}), 200
 
-        # Queue for async processing
-        try:
-            webhook_queue.put_nowait((vip_processor, data, None, 'lifecycle'))
-            logger.info("Webhook queued for processing: vip/lifecycle")
-        except:
-            logger.warning("Webhook queue full - processing synchronously")
-            vip_processor.process_lifecycle_update(data)
+        # Inbox first (durable), then the queue
+        enqueue(vip_processor, data, None, 'lifecycle')
 
         # ALWAYS return 200 immediately
         return jsonify({'status': 'received'}), 200
@@ -1191,13 +1303,8 @@ def faster_internal_note():
             logger.warning(f"faster_internal_note: unexpected event type '{event_type}', ignoring")
             return jsonify({'status': 'received'}), 200
 
-        # Queue for async processing
-        try:
-            webhook_queue.put_nowait((faster_processor, data, None, 'internal_note'))
-            logger.info("Webhook queued for processing: faster/internal-note")
-        except:
-            logger.warning("Webhook queue full - processing synchronously")
-            faster_processor.process_internal_note(data)
+        # Inbox first (durable), then the queue
+        enqueue(faster_processor, data, None, 'internal_note')
 
         # ALWAYS return 200 immediately
         return jsonify({'status': 'received'}), 200
@@ -1223,13 +1330,8 @@ def vip_internal_note():
             logger.warning(f"vip_internal_note: unexpected event type '{event_type}', ignoring")
             return jsonify({'status': 'received'}), 200
 
-        # Queue for async processing
-        try:
-            webhook_queue.put_nowait((vip_processor, data, None, 'internal_note'))
-            logger.info("Webhook queued for processing: vip/internal-note")
-        except:
-            logger.warning("Webhook queue full - processing synchronously")
-            vip_processor.process_internal_note(data)
+        # Inbox first (durable), then the queue
+        enqueue(vip_processor, data, None, 'internal_note')
 
         # ALWAYS return 200 immediately
         return jsonify({'status': 'received'}), 200
@@ -1287,7 +1389,8 @@ def health():
             'time_since_last_failure': int(time.time() - circuit_breaker_last_failure) if circuit_breaker_last_failure > 0 else 0
         },
         'mongodb': mongodb_status,
-        'supabase_mirror': {'enabled': supabase_mirror.ENABLED, **supabase_mirror.stats},
+        'supabase_mirror': {'enabled': supabase_mirror.ENABLED, 'inbox': supabase_mirror.INBOX, **supabase_mirror.stats},
+        'mongo_write': MONGO_WRITE,
         'endpoints': {
             'faster_incoming': '/webhook/faster/incoming',
             'faster_outgoing': '/webhook/faster/outgoing',
